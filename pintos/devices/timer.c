@@ -91,7 +91,7 @@ void timer_sleep(int64_t ticks) {
 
     ASSERT(intr_get_level() == INTR_ON);  // 왜? ->
                                           //    ASSERT(ticks >= 0);
-    if (ticks >= 0)
+    if (ticks > 0)
         thread_sleep(start + ticks);
 
     //    if (ticks == 0)
@@ -121,6 +121,7 @@ void timer_print_stats(void) {
 /* Timer interrupt handler. */
 static void timer_interrupt(struct intr_frame *args UNUSED) {
     ticks++;
+    thread_awake();
     thread_tick();
 }
 

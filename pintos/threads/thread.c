@@ -68,9 +68,6 @@ static void init_thread(struct thread *, const char *name, int priority);
 static void do_schedule(int status);
 static void schedule(void);
 static tid_t allocate_tid(void);
-static bool wake_early(const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED);
-static bool higher_priority(const struct list_elem *a_, const struct list_elem *b_,
-                            void *aux UNUSED);
 
 /* Returns true if T appears to point to a valid thread. */
 #define is_thread(t) ((t) != NULL && (t)->magic == THREAD_MAGIC)
@@ -120,7 +117,6 @@ void thread_init(void) {
     init_thread(initial_thread, "main", PRI_DEFAULT);
     initial_thread->status = THREAD_RUNNING;
     initial_thread->tid = allocate_tid();
-    initial_thread->wake_time = -1;
 }
 
 /* Starts preemptive thread scheduling by enabling interrupts.
@@ -142,8 +138,6 @@ void thread_start(void) {
    Thus, this function runs in an external interrupt context. */
 void thread_tick(void) {
     struct thread *t, *wake;
-    int64_t now = timer_ticks();
-
     t = thread_current();
 
     /* Update statistics. */
@@ -158,15 +152,6 @@ void thread_tick(void) {
 
     /* Enforce preemption. */
     thread_ticks++;
-
-    while (!list_empty(&sleep_list) &&
-           list_entry(list_front(&sleep_list), struct thread, elem)->wake_time <= now) {
-        wake = list_entry(list_pop_front(&sleep_list), struct thread, elem);
-        wake->status = THREAD_READY;
-        wake->wake_time = -1;
-        // list_push_back(&ready_list, &wake->elem);
-        list_insert_ordered(&ready_list, &wake->elem, higher_priority, NULL);
-    }
 
     if (thread_ticks >= TIME_SLICE)
         intr_yield_on_return();
@@ -222,6 +207,10 @@ tid_t thread_create(const char *name, int priority, thread_func *function, void 
     /* Add to run queue. */
     thread_unblock(t);
 
+    if (thread_current()->priority < priority)
+        thread_yield();
+
+    //    printf("%d\n", thread_get_priority());
     return tid;
 }
 
@@ -326,7 +315,18 @@ void thread_yield(void) {
 
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void thread_set_priority(int new_priority) {
-    thread_current()->priority = new_priority;
+    int top_priority = -1;
+    struct thread *curr = thread_current();
+
+    if (curr->priority < new_priority)
+        curr->priority = new_priority;
+    curr->o_priority = new_priority;
+
+    if (!list_empty(&ready_list))
+        top_priority = list_entry(list_front(&ready_list), struct thread, elem)->priority;
+
+    if (top_priority > new_priority)
+        thread_yield();
 }
 
 /* Returns the current thread's priority. */
@@ -414,6 +414,10 @@ static void init_thread(struct thread *t, const char *name, int priority) {
     strlcpy(t->name, name, sizeof t->name);
     t->tf.rsp = (uint64_t)t + PGSIZE - sizeof(void *);
     t->priority = priority;
+    t->o_priority = priority;
+    list_init(&t->donation_list);
+    t->wait_on_lock = NULL;
+    t->wake_time = -1;
     t->magic = THREAD_MAGIC;
 }
 
@@ -601,15 +605,14 @@ void thread_sleep(int64_t wake_time) {
     //    curr->status = THREAD_BLOCKED;
     curr->wake_time = wake_time;
     list_insert_ordered(&sleep_list, &curr->elem, wake_early, NULL);
-
-    do_schedule(THREAD_BLOCKED);
+    thread_block();
 
     intr_set_level(old_level);
 }
 
 /* Returns true if value A is less than value B, false
    otherwise. */
-static bool wake_early(const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED) {
+bool wake_early(const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED) {
     const struct thread *a = list_entry(a_, struct thread, elem);
     const struct thread *b = list_entry(b_, struct thread, elem);
 
@@ -618,10 +621,54 @@ static bool wake_early(const struct list_elem *a_, const struct list_elem *b_, v
     return a->wake_time < b->wake_time;
 }
 
-static bool higher_priority(const struct list_elem *a_, const struct list_elem *b_,
-                            void *aux UNUSED) {
+bool higher_priority(const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED) {
     const struct thread *a = list_entry(a_, struct thread, elem);
     const struct thread *b = list_entry(b_, struct thread, elem);
 
     return a->priority > b->priority;
+}
+
+bool lower_priority(const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED) {
+    const struct thread *a = list_entry(a_, struct thread, elem);
+    const struct thread *b = list_entry(b_, struct thread, elem);
+
+    return a->priority < b->priority;
+}
+
+void thread_awake() {
+    int64_t now = timer_ticks();
+
+    while (!list_empty(&sleep_list) &&
+           list_entry(list_front(&sleep_list), struct thread, elem)->wake_time <= now) {
+        struct thread *wake = list_entry(list_pop_front(&sleep_list), struct thread, elem);
+        wake->wake_time = -1;
+        thread_unblock(wake);
+    }
+}
+
+int get_high_donation(struct thread *t) {
+    return list_entry(list_back(&t->donation_list), struct thread, donation_elem)->priority;
+}
+
+void remove_donations(struct lock *lock, struct thread *t) {
+    struct list_elem *e = list_begin(&t->donation_list);
+
+    while (e != list_end(&t->donation_list)) {
+        struct thread *donator = list_entry(e, struct thread, donation_elem);
+        if (donator->wait_on_lock == lock) {
+            e = list_remove(e);
+        } else {
+            e = list_next(e);
+        }
+    }
+}
+
+void set_donations_priority(struct lock *lock, struct thread *holder) {
+    int priority_to_donate = holder->priority;
+    while (holder->wait_on_lock != NULL) {
+        holder = holder->wait_on_lock->holder;
+        if (holder->priority >= priority_to_donate)
+            break;
+        holder->priority = priority_to_donate;
+    }
 }
